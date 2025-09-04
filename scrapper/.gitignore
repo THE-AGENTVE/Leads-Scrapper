@@ -1,0 +1,8 @@
+node_modules/
+scraper.log
+*.xlsx
+*.csv
+.env
+.cache/
+.DS_Store
+npm-debug.log*
