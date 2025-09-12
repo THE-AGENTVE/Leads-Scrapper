@@ -8,8 +8,50 @@ import readline from "readline";
 import chalk from "chalk";
 import winston from "winston";
 import pLimit from "p-limit";
+import { callSLM } from "./slm-client.js";
+import "dotenv/config";
 
-// Setup Winston logger
+
+async function enrichWithSLM(item) {
+  const prompt = `
+Classify this lead in clean format:
+
+Name: ${item.name}
+Category: ${item.category}
+Description: ${item.description}
+Website: ${item.website || "N/A"}
+Email: ${item.email || "N/A"}
+
+Return ONLY valid JSON in this format:
+{ "isRelevant": true/false, "cleanCategory": "string", "summary": "string" }
+`;
+  console.log("Prompt sent to SLM:", prompt);
+
+  console.log("Sending to SLM:", item.name);  
+
+  try {
+    const response = await callSLM(prompt);
+    console.log("SLM response:", response);  
+
+    return { 
+      ...item, 
+      ...response,
+      originalCategory: item.category,
+      originalDescription: item.description
+    };
+  } catch (err) {
+    console.error("SLM error:", err);
+    return { 
+      ...item, 
+      isRelevant: false, 
+      cleanCategory: item.category, 
+      summary: item.description,
+      originalCategory: item.category,
+      originalDescription: item.description
+    };
+  }
+}
+
 const logger = winston.createLogger({
   level: "info",
   format: winston.format.combine(
@@ -24,11 +66,10 @@ const logger = winston.createLogger({
   ],
 });
 
-// Initialize Puppeteer with StealthPlugin
 PuppeteerExtra.use(StealthPlugin());
 const puppeteerExtra = PuppeteerExtra;
 
-// Utility function for random delay
+
 const getRandomDelay = (min, max) =>
   Math.floor(Math.random() * (max - min + 1)) + min;
 
@@ -37,7 +78,6 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const cleanPhoneNumber = (phone) => {
   if (!phone) return "";
 
-  // Remove common unwanted text and icons
   const cleaned = phone
     .replace(/Send to phone/g, "")
     .replace(/Send to phone/gi, "")
@@ -80,14 +120,59 @@ const qualifyLead = (item) => {
   return errors;
 };
 
-// Save to Excel/CSV
 const saveToExcel = (data, filePath) => {
   try {
-    const wb = xlsx.utils.book_new();
-    const ws = xlsx.utils.json_to_sheet(data);
-    xlsx.utils.book_append_sheet(wb, ws, "BusinessData");
-    xlsx.writeFile(wb, filePath.replace(".xlsx", ".csv"), { bookType: "xlsx" });
-    logger.info(chalk.green(`✓ Saved data to ${filePath}`));
+    let wb;
+    let ws;
+    let existingData = [];
+
+    // Check if file already exists
+    try {
+      wb = xlsx.readFile(filePath);
+      ws = wb.Sheets[wb.SheetNames[0]];
+      existingData = xlsx.utils.sheet_to_json(ws);
+    } catch (err) {
+      // File doesn't exist, create a new workbook
+      wb = xlsx.utils.book_new();
+    }
+
+    const createBusinessId = (item) => {
+      // Use name + phone + address to create a unique ID
+      return `${item.name || ''}-${item.phone || ''}-${item.address || ''}`.toLowerCase().replace(/\s+/g, '');
+    };
+
+    // Create a Set of existing business IDs for quick lookup
+    const existingBusinessIds = new Set();
+    existingData.forEach(item => {
+      const businessId = createBusinessId(item);
+      existingBusinessIds.add(businessId);
+    });
+
+    // Filter out duplicates from new data
+    const uniqueNewData = data.filter(item => {
+      const businessId = createBusinessId(item);
+      return !existingBusinessIds.has(businessId);
+    });
+
+    // Combine existing data with unique new data
+    const allData = [...existingData, ...uniqueNewData];
+    
+    // Create worksheet with all data
+    ws = xlsx.utils.json_to_sheet(allData);
+    
+    // If workbook is new, add the sheet to it
+    if (wb.SheetNames.length === 0) {
+      xlsx.utils.book_append_sheet(wb, ws, "BusinessData");
+    } else {
+      // Replace the first sheet with updated data
+      wb.Sheets[wb.SheetNames[0]] = ws;
+    }
+    
+    // Write to file
+    xlsx.writeFile(wb, filePath);
+    
+    logger.info(chalk.green(`✓ Saved/Appended data to ${filePath}`));
+    logger.info(chalk.blue(`✓ Added ${uniqueNewData.length} new records, skipped ${data.length - uniqueNewData.length} duplicates`));
   } catch (err) {
     logger.error(chalk.red(`Error saving to xlsx: ${err.message}`));
   }
@@ -170,7 +255,6 @@ const connectToMongoDB = async () => {
       address: { type: String, default: null },
       category: { type: String, default: null },
       website: { type: String, default: null },
-      hoursOfOperation: { type: String, default: null },
       email: { type: String, default: null },
       description: { type: String, default: null },
       source: { type: String, default: "google_maps" },
@@ -229,7 +313,6 @@ const autoScrollGoogleMaps = async (page, maxResults) => {
   let retries = 0;
 
   while (true) {
-    
     const currentCount = await page.evaluate(() => {
       return document.querySelectorAll('div[role="article"], div.Nv2PK').length;
     });
@@ -494,31 +577,45 @@ const extractDescription = async (page) => {
         'div[class*="overview-content"]',
         'div[itemprop="description"]',
         'meta[property="og:description"]',
-        'meta[name="description"]'
+        'meta[name="description"]',
       ];
 
       // Try to get description from meta tags first
-      const metaDescription = document.querySelector('meta[property="og:description"], meta[name="description"]');
-      if (metaDescription && metaDescription.content && metaDescription.content.length > 20) {
+      const metaDescription = document.querySelector(
+        'meta[property="og:description"], meta[name="description"]'
+      );
+      if (
+        metaDescription &&
+        metaDescription.content &&
+        metaDescription.content.length > 20
+      ) {
         return metaDescription.content;
       }
 
       for (const selector of selectors) {
         const elements = document.querySelectorAll(selector);
         for (const element of elements) {
-          if (element.offsetParent !== null) { // Only visible elements
+          if (element.offsetParent !== null) {
+            // Only visible elements
             const text = element.textContent.trim();
-            if (text && text.length > 30 && text.length < 500) { // Reasonable length for description
+            if (text && text.length > 30 && text.length < 500) {
+              // Reasonable length for description
               return text;
             }
           }
         }
       }
 
-      const aboutHeaders = document.querySelectorAll('h2, h3, h4, div[aria-label]');
+      const aboutHeaders = document.querySelectorAll(
+        "h2, h3, h4, div[aria-label]"
+      );
       for (const header of aboutHeaders) {
         const headerText = header.textContent.toLowerCase();
-        if (headerText.includes('about') || headerText.includes('description') || headerText.includes('overview')) {
+        if (
+          headerText.includes("about") ||
+          headerText.includes("description") ||
+          headerText.includes("overview")
+        ) {
           const nextSibling = header.nextElementSibling;
           if (nextSibling && nextSibling.textContent.trim().length > 20) {
             return nextSibling.textContent.trim();
@@ -533,11 +630,11 @@ const extractDescription = async (page) => {
 
     // Clean description
     const cleaned = description
-      .replace(/[\n\r\t]+/g, ' ') 
-      .replace(/\s+/g, ' ') // Normalize spaces
-      .replace(/[^\w\s.,!?\-&@#%$*()]/g, '')
+      .replace(/[\n\r\t]+/g, " ")
+      .replace(/\s+/g, " ") // Normalize spaces
+      .replace(/[^\w\s.,!?\-&@#%$*()]/g, "")
       .trim()
-      .substring(0, 300); 
+      .substring(0, 300);
 
     return cleaned.length > 10 ? cleaned : null;
   } catch (err) {
@@ -558,8 +655,8 @@ const extractEmailFromWebsite = async (page, website, businessName) => {
     await retry(
       async () => {
         await page.goto(website, {
-          waitUntil: 'domcontentloaded', 
-          timeout: 30000
+          waitUntil: "domcontentloaded",
+          timeout: 30000,
         });
       },
       2,
@@ -721,7 +818,6 @@ const parseGoogleMapsAPIData = async (page) => {
                   business[4]?.[8] || business.user_ratings_total || "0",
                 phone: business[178]?.[0]?.[0] || business.phone || "",
                 website: business[7]?.[0] || business.website || "",
-                hoursOfOperation: business[34] || business.hours || "",
                 email: "",
                 description: business[3]?.[1] || business.description || "", // Add description from API
                 detailsNeeded: true,
@@ -818,7 +914,6 @@ const parseGoogleMapsAPIData = async (page) => {
                 business[4]?.[8] || business.user_ratings_total || "0",
               phone: business[178]?.[0]?.[0] || business.phone || "",
               website: business[7]?.[0] || business.website || "",
-              hoursOfOperation: business[34] || business.hours || "",
               email: "",
               description: "",
               detailsNeeded: true,
@@ -895,7 +990,9 @@ const extractYellowPagesData = async (page) => {
 
           // Extract description from Yellow Pages
           const description = $(el)
-            .find('.snippet, .description, [class*="desc"], .business-description')
+            .find(
+              '.snippet, .description, [class*="desc"], .business-description'
+            )
             .first()
             .text()
             .trim()
@@ -928,7 +1025,6 @@ const extractYellowPagesData = async (page) => {
             rating,
             ratingCount,
             website: website && website.startsWith("http") ? website : null,
-            hoursOfOperation: "",
             email: "",
             description: description || "", // Add description here
             detailsNeeded: true,
@@ -1026,13 +1122,13 @@ const scrapeYellowPagesDetail = async (browser, item) => {
     if (!item.description || item.description.length < 20) {
       const additionalDescription = await page.evaluate(() => {
         const descriptionSelectors = [
-          '.business-description',
-          '.description-content',
-          '.about-business',
-          '.snippet',
+          ".business-description",
+          ".description-content",
+          ".about-business",
+          ".snippet",
           '[itemprop="description"]',
-          '.additional-info',
-          '.details-content'
+          ".additional-info",
+          ".details-content",
         ];
 
         for (const selector of descriptionSelectors) {
@@ -1292,7 +1388,6 @@ const scrapeGoogleMaps = async (browser, query, location, maxResults) => {
             ratingCount,
             phone,
             website,
-            hoursOfOperation: "",
             email: "",
             description: "",
             detailsNeeded: true,
@@ -1464,12 +1559,15 @@ const extractGoogleMapsContactInfo = async (browser, item) => {
     // Extract contact info
     const contactInfo = await extractContactInfoWithoutClicking(page);
     if (contactInfo.phone && !item.phone) item.phone = contactInfo.phone;
-    if (contactInfo.website && !item.website) item.website = contactInfo.website;
+    if (contactInfo.website && !item.website)
+      item.website = contactInfo.website;
 
     // Extract address if missing
     if (!item.address) {
       const addressInfo = await page.evaluate(() => {
-        const addressButton = document.querySelector('button[data-item-id="address"]');
+        const addressButton = document.querySelector(
+          'button[data-item-id="address"]'
+        );
         if (addressButton) {
           const addressElement = addressButton.querySelector(".Io6YTe");
           return addressElement ? addressElement.textContent.trim() : "";
@@ -1506,7 +1604,11 @@ const scrapeYellowPages = async (browser, query, location, maxResults) => {
   let hasMorePages = true;
   let consecutiveFailures = 0;
 
-  while (allListings.length < maxResults && hasMorePages && consecutiveFailures < 3) {
+  while (
+    allListings.length < maxResults &&
+    hasMorePages &&
+    consecutiveFailures < 3
+  ) {
     const page = await browser.newPage();
     await setupAntiDetection(page);
     await page.setDefaultNavigationTimeout(60000);
@@ -1531,9 +1633,12 @@ const scrapeYellowPages = async (browser, query, location, maxResults) => {
 
       // More flexible waiting for results
       try {
-        await page.waitForSelector('.result, .search-result, .business-listing', { 
-          timeout: 15000 
-        });
+        await page.waitForSelector(
+          ".result, .search-result, .business-listing",
+          {
+            timeout: 15000,
+          }
+        );
       } catch (waitError) {
         logger.warn(chalk.yellow(`No results found on page ${currentPage}`));
         consecutiveFailures++;
@@ -1543,66 +1648,81 @@ const scrapeYellowPages = async (browser, query, location, maxResults) => {
       // Extract listings
       const listings = await page.evaluate(() => {
         const results = [];
-        const listingElements = document.querySelectorAll('.result, .search-result, .business-listing');
-        
+        const listingElements = document.querySelectorAll(
+          ".result, .search-result, .business-listing"
+        );
+
         listingElements.forEach((el) => {
           try {
-            const nameElement = el.querySelector('.business-name, .srp-business-title, .business-name span');
+            const nameElement = el.querySelector(
+              ".business-name, .srp-business-title, .business-name span"
+            );
             if (!nameElement) return;
 
             const name = nameElement.textContent.trim();
             if (!name) return;
 
-            const phoneElement = el.querySelector('.phones, .srp-phone, .phone');
-            const addressElement = el.querySelector('.adr, .srp-address, .address');
-            const categoryElement = el.querySelector('.categories, .srp-categories, .category');
-            
+            const phoneElement = el.querySelector(
+              ".phones, .srp-phone, .phone"
+            );
+            const addressElement = el.querySelector(
+              ".adr, .srp-address, .address"
+            );
+            const categoryElement = el.querySelector(
+              ".categories, .srp-categories, .category"
+            );
+
             // Extract website
-            let website = '';
+            let website = "";
             const websiteSelectors = [
-              'a.track-visit-website',
-              'a.website-link',
-              'a.business-website',
-              'a[href*="http"]:not([href*="yellowpages.com"])'
+              "a.track-visit-website",
+              "a.website-link",
+              "a.business-website",
+              'a[href*="http"]:not([href*="yellowpages.com"])',
             ];
-            
+
             for (const selector of websiteSelectors) {
               const websiteEl = el.querySelector(selector);
               if (websiteEl && websiteEl.href) {
                 const href = websiteEl.href;
-                if (!href.includes('yellowpages.com') && !href.includes('track')) {
-                  website = href.split('?')[0]; // Remove tracking parameters
+                if (
+                  !href.includes("yellowpages.com") &&
+                  !href.includes("track")
+                ) {
+                  website = href.split("?")[0]; // Remove tracking parameters
                   break;
                 }
               }
             }
 
             // Get detail URL
-            const detailLink = el.querySelector('a.business-name') || 
-                             el.querySelector('a[href*="/mip/"]') ||
-                             el.querySelector('a[href^="/"]');
-            const detailUrl = detailLink ? detailLink.getAttribute('href') : '';
+            const detailLink =
+              el.querySelector("a.business-name") ||
+              el.querySelector('a[href*="/mip/"]') ||
+              el.querySelector('a[href^="/"]');
+            const detailUrl = detailLink ? detailLink.getAttribute("href") : "";
 
             results.push({
               name: name,
-              phone: phoneElement ? phoneElement.textContent.trim() : '',
-              address: addressElement ? addressElement.textContent.trim() : '',
-              category: categoryElement ? categoryElement.textContent.trim() : '',
+              phone: phoneElement ? phoneElement.textContent.trim() : "",
+              address: addressElement ? addressElement.textContent.trim() : "",
+              category: categoryElement
+                ? categoryElement.textContent.trim()
+                : "",
               website: website,
-              source: 'yellow_pages',
-              rating: '',
-              ratingCount: '',
-              email: '',
-              hoursOfOperation: '',
-              description: '',
+              source: "yellow_pages",
+              rating: "",
+              ratingCount: "",
+              email: "",
+              description: "",
               detailsNeeded: true,
-              detailUrl: detailUrl
+              detailUrl: detailUrl,
             });
           } catch (error) {
-            console.error('Error parsing listing:', error);
+            console.error("Error parsing listing:", error);
           }
         });
-        
+
         return results;
       });
 
@@ -1611,22 +1731,31 @@ const scrapeYellowPages = async (browser, query, location, maxResults) => {
         consecutiveFailures++;
       } else {
         allListings = [...allListings, ...listings];
-        logger.info(chalk.blue(`Extracted ${listings.length} items from page ${currentPage}`));
+        logger.info(
+          chalk.blue(
+            `Extracted ${listings.length} items from page ${currentPage}`
+          )
+        );
         consecutiveFailures = 0; // Reset on success
       }
 
       // Check for next page
       const nextPageExists = await page.evaluate(() => {
-        const nextButton = document.querySelector('a.next, .next-page, .pagination-next, a[aria-label="Next page"]');
-        return nextButton !== null && 
-               !nextButton.disabled && 
-               nextButton.offsetParent !== null;
+        const nextButton = document.querySelector(
+          'a.next, .next-page, .pagination-next, a[aria-label="Next page"]'
+        );
+        return (
+          nextButton !== null &&
+          !nextButton.disabled &&
+          nextButton.offsetParent !== null
+        );
       });
 
       hasMorePages = nextPageExists && allListings.length < maxResults;
-
     } catch (error) {
-      logger.error(chalk.red(`Error scraping page ${currentPage}: ${error.message}`));
+      logger.error(
+        chalk.red(`Error scraping page ${currentPage}: ${error.message}`)
+      );
       consecutiveFailures++;
     } finally {
       await page.close();
@@ -1634,7 +1763,7 @@ const scrapeYellowPages = async (browser, query, location, maxResults) => {
 
     if (hasMorePages) {
       currentPage++;
-      await sleep(getRandomDelay(4000, 7000)); 
+      await sleep(getRandomDelay(4000, 7000));
     }
   }
 
@@ -1643,7 +1772,7 @@ const scrapeYellowPages = async (browser, query, location, maxResults) => {
   );
   return allListings.slice(0, maxResults);
 };
-// Main function to orchestrate scraping
+
 const main = async () => {
   const rl = readline.createInterface({
     input: process.stdin,
@@ -1767,7 +1896,7 @@ const main = async () => {
     // extract detailed contact information
     console.log(chalk.cyan("\nExtracting detailed contact information..."));
 
-    const detailLimit = pLimit(2); 
+    const detailLimit = pLimit(2);
 
     // Create a new browser instance for detail extraction to avoid connection issues
     const detailBrowser = await puppeteerExtra.launch({
@@ -1819,7 +1948,7 @@ const main = async () => {
       // Use puppeteer-cluster for better resource management
       const cluster = await Cluster.launch({
         concurrency: Cluster.CONCURRENCY_CONTEXT,
-        maxConcurrency: 3, 
+        maxConcurrency: 3,
         puppeteerOptions: {
           headless: false,
           args: [
@@ -1827,8 +1956,8 @@ const main = async () => {
             "--disable-setuid-sandbox",
             "--disable-web-security",
             "--disable-features=IsolateOrigins,site-per-process",
-            "--memory-growth-limit=2048", 
-            "--max-old-space-size=2048", 
+            "--memory-growth-limit=2048",
+            "--max-old-space-size=2048",
             "--disable-site-isolation-trials",
             "--disable-blink-features=AutomationControlled",
             "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -1877,10 +2006,39 @@ const main = async () => {
         await cluster.close();
       }
     }
-    // Save to db
+    
+    // SLM Enrichment - Add this section
+    console.log(chalk.cyan("\nEnriching data with SLM classification..."));
+    
+    const enrichedResults = [];
+    for (let i = 0; i < allResults.length; i++) {
+      const item = allResults[i];
+      console.log(chalk.blue(`Enriching ${item.name} (${i + 1}/${allResults.length})`));
+      
+      try {
+        const enriched = await enrichWithSLM(item);
+        enrichedResults.push(enriched);
+      } catch (err) {
+        console.error(chalk.red(`SLM enrichment failed for ${item.name}: ${err.message}`));
+        // Add item without SLM data if enrichment fails
+        enrichedResults.push({
+          ...item,
+          isRelevant: false,
+          cleanCategory: item.category,
+          summary: item.description,
+          originalCategory: item.category,
+          originalDescription: item.description
+        });
+      }
+      
+      // Add delay to avoid rate limiting
+      await sleep(getRandomDelay(1000, 3000));
+    }
+
+    // Save to db (with SLM fields)
     if (mongoConnected) {
       console.log(chalk.cyan("\nSaving data to MongoDB..."));
-      for (const item of allResults) {
+      for (const item of enrichedResults) {
         try {
           const errors = [...validateData(item), ...qualifyLead(item)];
 
@@ -1907,13 +2065,13 @@ const main = async () => {
 
     // Save to Excel
     const excelPath = `./${outputFileName || "business_leads"}.xlsx`;
-    const qualifiedResults = allResults.filter(
+    const qualifiedResults = enrichedResults.filter(
       (item) => qualifyLead(item).length === 0
     );
 
     console.log(
       chalk.green(
-        `\n${qualifiedResults.length} qualified leads found out of ${allResults.length}`
+        `\n${qualifiedResults.length} qualified leads found out of ${enrichedResults.length}`
       )
     );
 
