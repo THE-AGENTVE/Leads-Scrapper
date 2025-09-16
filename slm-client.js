@@ -1,9 +1,9 @@
 import fetch from "node-fetch";
 import "dotenv/config";
 
-const HF_API_KEY =  process.env.HF_TOKEN;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 
-console.log("HF_API_KEY loaded?", HF_API_KEY ? "✅ Yes" : "❌ No");
+console.log("OPENAI_API_KEY loaded?", OPENAI_API_KEY ? "Yes" : "No");
 
 function extractJSON(raw) {
   const match = raw.match(/\{[\s\S]*\}/);
@@ -17,25 +17,27 @@ function extractJSON(raw) {
 
 export async function callSLM(prompt) {
   try {
-    const response = await fetch(
-      "https://router.huggingface.co/v1/chat/completions",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${HF_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model: "mistralai/Mistral-7B-Instruct-v0.2:featherless-ai",
-          messages: [
-            {
-              role: "user",
-              content: prompt,
-            },
-          ],
-        }),
-      }
-    );
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are a lead classification assistant. Always return response in strict JSON with keys: isRelevant, cleanCategory, summary.",
+          },
+          {
+            role: "user",
+            content: prompt,
+          },
+        ],
+      }),
+    });
 
     const data = await response.json();
     console.log("RAW:", JSON.stringify(data));
@@ -50,7 +52,7 @@ export async function callSLM(prompt) {
       };
     }
 
-    // ✅ First try to parse direct JSON
+    //First try to parse direct JSON
     let parsed = extractJSON(text);
     if (parsed) return parsed;
 
